@@ -197,7 +197,7 @@ jobs:
         
         echo "Deployment completed successfully!"
         
-        # Show service status
+        # Show service status1
         aws ecs describe-services \
           --cluster $ECS_CLUSTER \
           --services $ECS_SERVICE \
