@@ -24,6 +24,13 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
+    - name: Get AWS Account ID
+      id: aws-account
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
+        echo "AWS Account ID: $AWS_ACCOUNT_ID"
+
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
@@ -37,8 +44,8 @@ jobs:
 
     - name: Setup IAM roles and prerequisites
       run: |
-        AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
-        EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole"
+        EXECUTION_ROLE_ARN="arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole"
+        echo "EXECUTION_ROLE_ARN=$EXECUTION_ROLE_ARN" >> $GITHUB_ENV
         
         # Create trust policy for ECS tasks
         cat > ecs-task-trust-policy.json << EOF
@@ -87,14 +94,14 @@ jobs:
         else
           echo "ECS cluster already exists"
         fi
-        
-        echo "EXECUTION_ROLE_ARN=$EXECUTION_ROLE_ARN" >> $GITHUB_ENV
 
-    - name: Prepare task definition
+    - name: Prepare and register task definition
       run: |
         IMAGE_URI=${{ env.IMAGE_URI }}
-        AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
         EXECUTION_ROLE_ARN=${{ env.EXECUTION_ROLE_ARN }}
+        
+        echo "Using IMAGE_URI: $IMAGE_URI"
+        echo "Using EXECUTION_ROLE_ARN: $EXECUTION_ROLE_ARN"
         
         # Try to get existing task definition, create new one if it doesn't exist
         if aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY --query taskDefinition > task-def.json 2>/dev/null; then
@@ -138,20 +145,13 @@ jobs:
         EOF
         fi
         
-        # Debug: Show current task definition
-        echo "Current task definition:"
-        cat task-def.json
-        
         # Create new task definition with only required fields
         jq '{family, containerDefinitions, executionRoleArn, networkMode, requiresCompatibilities, cpu, memory}' task-def.json > new-task-def.json
         
         # Debug: Show new task definition
-        echo "New task definition for registration:"
+        echo "Task definition for registration:"
         cat new-task-def.json
-
-    - name: Register new task definition
-      id: register-task-def
-      run: |
+        
         # Register the new task definition
         TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
         echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
