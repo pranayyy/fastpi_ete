@@ -95,6 +95,70 @@ jobs:
           echo "ECS cluster already exists"
         fi
 
+    - name: Setup RDS Database (Optional)
+      run: |
+        # Only create RDS if RDS_ENABLED secret is set to 'true'
+        if [ "${{ secrets.RDS_ENABLED }}" = "true" ]; then
+          echo "Setting up RDS database..."
+          
+          # Check if RDS instance exists
+          if ! aws rds describe-db-instances --db-instance-identifier fastapi-blogdb --region $AWS_REGION >/dev/null 2>&1; then
+            echo "Creating RDS instance..."
+            
+            # Get VPC ID from one of the subnets
+            VPC_ID=$(aws ec2 describe-subnets --subnet-ids $(echo "${{ secrets.SUBNET_IDS }}" | cut -d',' -f1) --query 'Subnets[0].VpcId' --output text --region $AWS_REGION)
+            echo "VPC ID: $VPC_ID"
+            
+            # Create DB subnet group
+            aws rds create-db-subnet-group \
+              --db-subnet-group-name fastapi-subnet-group \
+              --db-subnet-group-description "Subnet group for FastAPI RDS" \
+              --subnet-ids $(echo "${{ secrets.SUBNET_IDS }}" | tr ',' ' ') \
+              --region $AWS_REGION || echo "Subnet group may already exist"
+            
+            # Update Security Group for RDS
+            aws ec2 authorize-security-group-ingress \
+              --group-id ${{ secrets.SECURITY_GROUP_ID }} \
+              --protocol tcp \
+              --port 5432 \
+              --source-group ${{ secrets.SECURITY_GROUP_ID }} \
+              --region $AWS_REGION || echo "Security group rule may already exist"
+            
+            # Create RDS instance
+            aws rds create-db-instance \
+              --db-instance-identifier fastapi-blogdb \
+              --db-instance-class db.t3.micro \
+              --engine postgres \
+              --master-username postgres \
+              --master-user-password postgres \
+              --allocated-storage 20 \
+              --db-name blogdb \
+              --db-subnet-group-name fastapi-subnet-group \
+              --vpc-security-group-ids ${{ secrets.SECURITY_GROUP_ID }} \
+              --no-publicly-accessible \
+              --region $AWS_REGION
+            
+            echo "Waiting for RDS instance to be available..."
+            aws rds wait db-instance-available \
+              --db-instance-identifier fastapi-blogdb \
+              --region $AWS_REGION
+          else
+            echo "RDS instance already exists"
+          fi
+          
+          # Get RDS endpoint
+          RDS_ENDPOINT=$(aws rds describe-db-instances \
+            --db-instance-identifier fastapi-blogdb \
+            --query 'DBInstances[0].Endpoint.Address' \
+            --output text \
+            --region $AWS_REGION)
+          
+          echo "RDS_ENDPOINT=$RDS_ENDPOINT" >> $GITHUB_ENV
+          echo "RDS Endpoint: $RDS_ENDPOINT"
+        else
+          echo "RDS setup skipped. Using external database."
+        fi
+
     - name: Prepare and register task definition
       run: |
         IMAGE_URI=${{ env.IMAGE_URI }}
@@ -103,16 +167,20 @@ jobs:
         echo "Using IMAGE_URI: $IMAGE_URI"
         echo "Using EXECUTION_ROLE_ARN: $EXECUTION_ROLE_ARN"
         
-        # Try to get existing task definition, create new one if it doesn't exist
-        if aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY --query taskDefinition > task-def.json 2>/dev/null; then
-          echo "Found existing task definition, updating image..."
-          # Update the image in the existing task definition
-          jq --arg image "$IMAGE_URI" '.containerDefinitions[0].image = $image' task-def.json > temp-task-def.json
-          mv temp-task-def.json task-def.json
+        # Determine DATABASE_URL
+        if [ "${{ secrets.RDS_ENABLED }}" = "true" ] && [ -n "${{ env.RDS_ENDPOINT }}" ]; then
+          DATABASE_URL="postgresql://postgres:postgres@${{ env.RDS_ENDPOINT }}:5432/blogdb"
+        elif [ -n "${{ secrets.DATABASE_URL }}" ]; then
+          DATABASE_URL="${{ secrets.DATABASE_URL }}"
         else
-          echo "No existing task definition found, creating new one..."
-          # Create initial task definition
-          cat > task-def.json << EOF
+          echo "WARNING: No database configuration found. Using default localhost."
+          DATABASE_URL="postgresql://postgres:postgres@localhost:5432/blogdb"
+        fi
+        
+        echo "Using DATABASE_URL: ${DATABASE_URL%:*}:****@${DATABASE_URL##*@}"  # Hide password in logs
+        
+        # Create initial task definition with database configuration
+        cat > task-def.json << EOF
         {
           "family": "$ECS_TASK_DEFINITION_FAMILY",
           "networkMode": "awsvpc",
@@ -131,6 +199,12 @@ jobs:
                 }
               ],
               "essential": true,
+              "environment": [
+                {
+                  "name": "DATABASE_URL",
+                  "value": "$DATABASE_URL"
+                }
+              ],
               "logConfiguration": {
                 "logDriver": "awslogs",
                 "options": {
@@ -143,17 +217,9 @@ jobs:
           ]
         }
         EOF
-        fi
-        
-        # Create new task definition with only required fields
-        jq '{family, containerDefinitions, executionRoleArn, networkMode, requiresCompatibilities, cpu, memory}' task-def.json > new-task-def.json
-        
-        # Debug: Show new task definition
-        echo "Task definition for registration:"
-        cat new-task-def.json
         
         # Register the new task definition
-        TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+        TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
         echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
         echo "Task definition ARN: $TASK_DEF_ARN"
 
@@ -185,6 +251,7 @@ jobs:
             --launch-type FARGATE \
             --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}"
         fi
+
     - name: Wait for service to be stable
       run: |
         echo "Waiting for service to be stable..."
@@ -249,3 +316,34 @@ jobs:
           --services $ECS_SERVICE \
           --query 'services[0].{ServiceName:serviceName,Status:status,RunningCount:runningCount,DesiredCount:desiredCount}' \
           --output table
+
+    - name: Get service endpoint
+      run: |
+        # Get the public IP or load balancer endpoint
+        TASK_ARN=$(aws ecs list-tasks \
+          --cluster $ECS_CLUSTER \
+          --service-name $ECS_SERVICE \
+          --query 'taskArns[0]' \
+          --output text)
+        
+        if [ "$TASK_ARN" != "None" ] && [ -n "$TASK_ARN" ]; then
+          ENI_ID=$(aws ecs describe-tasks \
+            --cluster $ECS_CLUSTER \
+            --tasks $TASK_ARN \
+            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' \
+            --output text)
+          
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces \
+            --network-interface-ids $ENI_ID \
+            --query 'NetworkInterfaces[0].Association.PublicIp' \
+            --output text)
+          
+          if [ "$PUBLIC_IP" != "None" ] && [ -n "$PUBLIC_IP" ]; then
+            echo "✅ Application is accessible at: http://$PUBLIC_IP:8000"
+            echo "📚 API documentation: http://$PUBLIC_IP:8000/docs"
+          else
+            echo "⚠️  Could not determine public IP. Check ECS console for endpoint."
+          fi
+        else
+          echo "⚠️  No running tasks found. Check ECS service status."
+        fi
