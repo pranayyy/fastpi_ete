@@ -2,7 +2,7 @@ name: Deploy FastAPI to ECS Fargate
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
 
 env:
   AWS_REGION: ap-south-1
