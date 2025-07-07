@@ -41,22 +41,95 @@ jobs:
 
     - name: Get current ECS task definition
       id: get-task-def
+      if: steps.check-task-def.outputs.task_def_exists == 'true'
       run: |
         aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY \
           --query taskDefinition > task-def.json
+
+    - name: Create initial task definition
+      if: steps.check-task-def.outputs.task_def_exists == 'false'
+      run: |
+        IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        cat > task-def.json << EOF
+        {
+          "family": "$ECS_TASK_DEFINITION_FAMILY",
+          "networkMode": "awsvpc",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512",
+          "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+          "taskRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+          "containerDefinitions": [
+            {
+              "name": "$CONTAINER_NAME",
+              "image": "$IMAGE_URI",
+              "portMappings": [
+                {
+                  "containerPort": 8000,
+                  "protocol": "tcp"
+                }
+              ],
+              "essential": true,
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/$ECS_TASK_DEFINITION_FAMILY",
+                  "awslogs-region": "$AWS_REGION",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }
+          ]
+        }
+        EOF
 
     - name: Update task definition image
       id: update-task-def
       run: |
         IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-        sed -i "s|image.*|image\": \"$IMAGE_URI\",|" task-def.json
-        cat task-def.json | jq '{family, containerDefinitions, executionRoleArn, networkMode, requiresCompatibilities, cpu, memory}' > new-task-def.json
+        
+        # Update the image in the task definition
+        jq --arg image "$IMAGE_URI" '.containerDefinitions[0].image = $image' task-def.json > temp-task-def.json
+        mv temp-task-def.json task-def.json
+        
+        # Create new task definition with only required fields
+        jq '{family, containerDefinitions, executionRoleArn, taskRoleArn, networkMode, requiresCompatibilities, cpu, memory}' task-def.json > new-task-def.json
+        
+        # Register the new task definition
         TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
         echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+        echo "Task definition ARN: $TASK_DEF_ARN"
 
-    - name: Update ECS service with new task definition
+    - name: Check if ECS service exists
+      id: check-service
+      run: |
+        if aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE --query 'services[0].serviceName' --output text 2>/dev/null | grep -q $ECS_SERVICE; then
+          echo "service_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "service_exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Update ECS service
+      if: steps.check-service.outputs.service_exists == 'true'
       run: |
         aws ecs update-service \
           --cluster $ECS_CLUSTER \
           --service $ECS_SERVICE \
           --task-definition $TASK_DEF_ARN
+
+    - name: Create ECS service
+      if: steps.check-service.outputs.service_exists == 'false'
+      run: |
+        aws ecs create-service \
+          --cluster $ECS_CLUSTER \
+          --service-name $ECS_SERVICE \
+          --task-definition $TASK_DEF_ARN \
+          --desired-count 1 \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}"
+
+    - name: Wait for service to be stable
+      run: |
+        aws ecs wait services-stable \
+          --cluster $ECS_CLUSTER \
+          --services $ECS_SERVICE
