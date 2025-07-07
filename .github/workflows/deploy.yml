@@ -11,11 +11,9 @@ env:
   ECS_SERVICE: fastapi-service
   ECS_TASK_DEFINITION_FAMILY: fastapi-task
   CONTAINER_NAME: fastapi
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -36,21 +34,21 @@ jobs:
         IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
         docker build -t $IMAGE_URI .
         docker push $IMAGE_URI
-      env:
-        IMAGE_TAG: latest
 
-    - name: Get current ECS task definition
-      id: get-task-def
-      if: steps.check-task-def.outputs.task_def_exists == 'true'
-      run: |
-        aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY \
-          --query taskDefinition > task-def.json
-
-    - name: Create initial task definition
-      if: steps.check-task-def.outputs.task_def_exists == 'false'
+    - name: Prepare task definition
       run: |
         IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-        cat > task-def.json << EOF
+        
+        # Try to get existing task definition, create new one if it doesn't exist
+        if aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY --query taskDefinition > task-def.json 2>/dev/null; then
+          echo "Found existing task definition, updating image..."
+          # Update the image in the existing task definition
+          jq --arg image "$IMAGE_URI" '.containerDefinitions[0].image = $image' task-def.json > temp-task-def.json
+          mv temp-task-def.json task-def.json
+        else
+          echo "No existing task definition found, creating new one..."
+          # Create initial task definition
+          cat > task-def.json << EOF
         {
           "family": "$ECS_TASK_DEFINITION_FAMILY",
           "networkMode": "awsvpc",
@@ -82,54 +80,51 @@ jobs:
           ]
         }
         EOF
-
-    - name: Update task definition image
-      id: update-task-def
-      run: |
-        IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        fi
         
-        # Update the image in the task definition
-        jq --arg image "$IMAGE_URI" '.containerDefinitions[0].image = $image' task-def.json > temp-task-def.json
-        mv temp-task-def.json task-def.json
+        # Debug: Show current task definition
+        echo "Current task definition:"
+        cat task-def.json
         
         # Create new task definition with only required fields
         jq '{family, containerDefinitions, executionRoleArn, taskRoleArn, networkMode, requiresCompatibilities, cpu, memory}' task-def.json > new-task-def.json
         
-        # Register the new task definition
+        # Debug: Show new task definition
+        echo "New task definition for registration:"
+        cat new-task-def.json
+
+    - name: Register new task definition
+      id: register-task-def
+      run: |
         TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
         echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
         echo "Task definition ARN: $TASK_DEF_ARN"
 
-    - name: Check if ECS service exists
-      id: check-service
+    - name: Deploy to ECS
       run: |
+        # Check if service exists
         if aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE --query 'services[0].serviceName' --output text 2>/dev/null | grep -q $ECS_SERVICE; then
-          echo "service_exists=true" >> $GITHUB_OUTPUT
+          echo "Service exists, updating..."
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $TASK_DEF_ARN
         else
-          echo "service_exists=false" >> $GITHUB_OUTPUT
+          echo "Service doesn't exist, creating..."
+          aws ecs create-service \
+            --cluster $ECS_CLUSTER \
+            --service-name $ECS_SERVICE \
+            --task-definition $TASK_DEF_ARN \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}"
         fi
-
-    - name: Update ECS service
-      if: steps.check-service.outputs.service_exists == 'true'
-      run: |
-        aws ecs update-service \
-          --cluster $ECS_CLUSTER \
-          --service $ECS_SERVICE \
-          --task-definition $TASK_DEF_ARN
-
-    - name: Create ECS service
-      if: steps.check-service.outputs.service_exists == 'false'
-      run: |
-        aws ecs create-service \
-          --cluster $ECS_CLUSTER \
-          --service-name $ECS_SERVICE \
-          --task-definition $TASK_DEF_ARN \
-          --desired-count 1 \
-          --launch-type FARGATE \
-          --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}"
 
     - name: Wait for service to be stable
       run: |
+        echo "Waiting for service to be stable..."
         aws ecs wait services-stable \
           --cluster $ECS_CLUSTER \
-          --services $ECS_SERVICE
+          --services $ECS_SERVICE \
+          --max-attempts 30 \
+          --delay 10
