@@ -1,0 +1,62 @@
+name: Deploy FastAPI to ECS Fargate
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: fastapi-blog-api
+  ECS_CLUSTER: fastapi-cluster
+  ECS_SERVICE: fastapi-service
+  ECS_TASK_DEFINITION_FAMILY: fastapi-task
+  CONTAINER_NAME: fastapi
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build, Tag, and Push Docker image to ECR
+      run: |
+        IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        docker build -t $IMAGE_URI .
+        docker push $IMAGE_URI
+      env:
+        IMAGE_TAG: latest
+
+    - name: Get current ECS task definition
+      id: get-task-def
+      run: |
+        aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY \
+          --query taskDefinition > task-def.json
+
+    - name: Update task definition image
+      id: update-task-def
+      run: |
+        IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        sed -i "s|image.*|image\": \"$IMAGE_URI\",|" task-def.json
+        cat task-def.json | jq '{family, containerDefinitions, executionRoleArn, networkMode, requiresCompatibilities, cpu, memory}' > new-task-def.json
+        TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+        echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+
+    - name: Update ECS service with new task definition
+      run: |
+        aws ecs update-service \
+          --cluster $ECS_CLUSTER \
+          --service $ECS_SERVICE \
+          --task-definition $TASK_DEF_ARN
