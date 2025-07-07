@@ -1,9 +1,7 @@
 name: Deploy FastAPI to ECS Fargate
-
 on:
   push:
     branches: [ master ]
-
 env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: fastapi-blog-api
@@ -11,6 +9,7 @@ env:
   ECS_SERVICE: fastapi-service
   ECS_TASK_DEFINITION_FAMILY: fastapi-task
   CONTAINER_NAME: fastapi
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -34,10 +33,68 @@ jobs:
         IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
         docker build -t $IMAGE_URI .
         docker push $IMAGE_URI
+        echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+    - name: Setup IAM roles and prerequisites
+      run: |
+        AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+        EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole"
+        
+        # Create trust policy for ECS tasks
+        cat > ecs-task-trust-policy.json << EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+        EOF
+        
+        # Check if execution role exists, create if it doesn't
+        if ! aws iam get-role --role-name ecsTaskExecutionRole >/dev/null 2>&1; then
+          echo "Creating ecsTaskExecutionRole..."
+          
+          # Create the execution role
+          aws iam create-role \
+            --role-name ecsTaskExecutionRole \
+            --assume-role-policy-document file://ecs-task-trust-policy.json
+          
+          # Attach the managed policy
+          aws iam attach-role-policy \
+            --role-name ecsTaskExecutionRole \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+          
+          # Wait for role to be available
+          echo "Waiting for IAM role to be available..."
+          sleep 15
+        else
+          echo "ecsTaskExecutionRole already exists"
+        fi
+        
+        # Create CloudWatch log group if it doesn't exist
+        aws logs create-log-group --log-group-name /ecs/$ECS_TASK_DEFINITION_FAMILY --region $AWS_REGION 2>/dev/null || true
+        
+        # Create ECS cluster if it doesn't exist
+        if ! aws ecs describe-clusters --clusters $ECS_CLUSTER --query 'clusters[0].clusterName' --output text 2>/dev/null | grep -q $ECS_CLUSTER; then
+          echo "Creating ECS cluster..."
+          aws ecs create-cluster --cluster-name $ECS_CLUSTER
+        else
+          echo "ECS cluster already exists"
+        fi
+        
+        echo "EXECUTION_ROLE_ARN=$EXECUTION_ROLE_ARN" >> $GITHUB_ENV
 
     - name: Prepare task definition
       run: |
-        IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        IMAGE_URI=${{ env.IMAGE_URI }}
+        AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+        EXECUTION_ROLE_ARN=${{ env.EXECUTION_ROLE_ARN }}
         
         # Try to get existing task definition, create new one if it doesn't exist
         if aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION_FAMILY --query taskDefinition > task-def.json 2>/dev/null; then
@@ -55,8 +112,7 @@ jobs:
           "requiresCompatibilities": ["FARGATE"],
           "cpu": "256",
           "memory": "512",
-          "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
-          "taskRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+          "executionRoleArn": "$EXECUTION_ROLE_ARN",
           "containerDefinitions": [
             {
               "name": "$CONTAINER_NAME",
@@ -87,7 +143,7 @@ jobs:
         cat task-def.json
         
         # Create new task definition with only required fields
-        jq '{family, containerDefinitions, executionRoleArn, taskRoleArn, networkMode, requiresCompatibilities, cpu, memory}' task-def.json > new-task-def.json
+        jq '{family, containerDefinitions, executionRoleArn, networkMode, requiresCompatibilities, cpu, memory}' task-def.json > new-task-def.json
         
         # Debug: Show new task definition
         echo "New task definition for registration:"
@@ -96,6 +152,7 @@ jobs:
     - name: Register new task definition
       id: register-task-def
       run: |
+        # Register the new task definition
         TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
         echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
         echo "Task definition ARN: $TASK_DEF_ARN"
@@ -111,6 +168,15 @@ jobs:
             --task-definition $TASK_DEF_ARN
         else
           echo "Service doesn't exist, creating..."
+          # Check if we have required secrets for service creation
+          if [ -z "${{ secrets.SUBNET_IDS }}" ] || [ -z "${{ secrets.SECURITY_GROUP_ID }}" ]; then
+            echo "ERROR: SUBNET_IDS and SECURITY_GROUP_ID secrets are required for service creation"
+            echo "Please add these secrets to your GitHub repository:"
+            echo "- SUBNET_IDS: comma-separated list of subnet IDs"
+            echo "- SECURITY_GROUP_ID: security group ID"
+            exit 1
+          fi
+          
           aws ecs create-service \
             --cluster $ECS_CLUSTER \
             --service-name $ECS_SERVICE \
@@ -128,3 +194,12 @@ jobs:
           --services $ECS_SERVICE \
           --max-attempts 30 \
           --delay 10
+        
+        echo "Deployment completed successfully!"
+        
+        # Show service status
+        aws ecs describe-services \
+          --cluster $ECS_CLUSTER \
+          --services $ECS_SERVICE \
+          --query 'services[0].{ServiceName:serviceName,Status:status,RunningCount:runningCount,DesiredCount:desiredCount}' \
+          --output table
