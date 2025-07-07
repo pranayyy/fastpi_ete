@@ -185,19 +185,65 @@ jobs:
             --launch-type FARGATE \
             --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SECURITY_GROUP_ID }}],assignPublicIp=ENABLED}"
         fi
-
     - name: Wait for service to be stable
       run: |
         echo "Waiting for service to be stable..."
-        aws ecs wait services-stable \
-          --cluster $ECS_CLUSTER \
-          --services $ECS_SERVICE \
-          --max-attempts 30 \
-          --delay 10
+        
+        # Use a simple loop to wait for service stability
+        MAX_ATTEMPTS=30
+        DELAY=10
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+          
+          # Check service status
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].deployments[0].status' \
+            --output text 2>/dev/null || echo "FAILED")
+          
+          RUNNING_COUNT=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].runningCount' \
+            --output text 2>/dev/null || echo "0")
+          
+          DESIRED_COUNT=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].desiredCount' \
+            --output text 2>/dev/null || echo "0")
+          
+          echo "Service status: $SERVICE_STATUS"
+          echo "Running count: $RUNNING_COUNT, Desired count: $DESIRED_COUNT"
+          
+          # Check if service is stable
+          if [ "$SERVICE_STATUS" = "STABLE" ] && [ "$RUNNING_COUNT" = "$DESIRED_COUNT" ] && [ "$RUNNING_COUNT" != "0" ]; then
+            echo "Service is stable and running!"
+            break
+          fi
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "Service did not stabilize within the expected time"
+            echo "Final service status:"
+            aws ecs describe-services \
+              --cluster $ECS_CLUSTER \
+              --services $ECS_SERVICE \
+              --query 'services[0]' \
+              --output json
+            exit 1
+          fi
+          
+          echo "Waiting $DELAY seconds before next check..."
+          sleep $DELAY
+        done
         
         echo "Deployment completed successfully!"
         
-        # Show service status2
+        # Show final service status
         aws ecs describe-services \
           --cluster $ECS_CLUSTER \
           --services $ECS_SERVICE \
